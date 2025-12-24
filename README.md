@@ -80,7 +80,7 @@ Features
 
 Quick start (install & run)
 ---------------------------
-Requirements
+Requirements (Only if running source file. Release .exe file comes preinstalled)
 - Python 3.9+ (3.10/3.11 recommended)
 - PySide6
 
