@@ -78,14 +78,6 @@ Features
   - Informational dialogs after saves/exports
   - Selectable labels for easy copy/paste
 
-Screenshots (example)
----------------------
-(Replace with real screenshots from the app)
-- Dashboard showing totals and budget warnings
-- Add Transaction form
-- History table view
-- Monthly report output
-
 Quick start (install & run)
 ---------------------------
 Requirements
@@ -111,11 +103,6 @@ pip install PySide6
 # Run the application
 # Replace `main.py` below with the actual filename containing the app's entry point if different.
 python main.py
-```
-
-If a `requirements.txt` is provided, use:
-```bash
-pip install -r requirements.txt
 ```
 
 Usage / UI walkthrough
@@ -192,7 +179,6 @@ Limitations & known issues
 
 Development / project structure
 -------------------------------
-(Adjust according to actual repository layout; this is a common layout for the code you provided)
 
 - main.py (or app entrypoint)
 - README.md
@@ -231,19 +217,13 @@ If you're unsure where to start, suggested good-first-issues:
 - Replace SHA-256 PIN hashing with a proper KDF-based approach
 - Change amount handling to Decimal or integer cents
 - Implement atomic file writes and a configurable data directory
-
-License
--------
-This repository does not include a license by default. If you want to open source the project, a permissive license such as MIT is a common choice.
-
-Example (MIT):
+  
+MIT:
 ```
 MIT License
-Copyright (c) 2025 <Your Name>
+Copyright (c) 2025 Midaxas
 Permission is hereby granted, free of charge, to any person obtaining a copy...
 ```
-
-Replace with your preferred license and add a `LICENSE` file.
 
 Contact / author
 ----------------
