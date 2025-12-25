@@ -1,25 +1,165 @@
-import sys
-import json
-import csv
-import time
-import hashlib
-from dataclasses import dataclass
-from datetime import datetime, date
-from typing import List, Dict, Any, Optional
+#!/usr/bin/env python3
+"""
+Midaxas Finance - single-file polished app with custom title bar (frameless)
 
-from PySide6.QtCore import Qt
+This single-file app includes:
+ - Custom frameless TitleBar (removes native white title bar)
+ - theme (QSS) applied at startup
+ - non-blocking Toast notifications
+ - fade-in animations on page switches
+ - TransactionModel (QAbstractTableModel) + QTableView for history
+ - optional interactive chart on the Dashboard (pyqtgraph if installed)
+ - optional qtawesome icons (if installed)
+
+Requirements:
+ - Python 3.9+ (works with modern 3.x, tested with PySide6)
+ - PySide6
+
+Optional:
+ - pyqtgraph (pip install pyqtgraph) for charts
+ - qtawesome (pip install qtawesome) for icons
+
+Run:
+    pip install PySide6
+    python Tracker.py
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import sys
+import tempfile
+import time
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QPropertyAnimation,
+    QPoint,
+    QEasingCurve,
+    Qt,
+    QTimer,
+)
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QLineEdit, QTextEdit, QComboBox, QTableWidget, QTableWidgetItem,
-    QMessageBox, QFileDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QGroupBox,
-    QInputDialog
+    QApplication,
+    QAbstractItemView,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QStackedWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+    QFileDialog,
+    QTableView,
+    QHeaderView,
+    QGraphicsOpacityEffect,
+    QInputDialog,
 )
 
+# Optional imports
+try:
+    import qtawesome as qta  # type: ignore
+except Exception:
+    qta = None
+
+try:
+    import pyqtgraph as pg  # type: ignore
+    from pyqtgraph import PlotWidget  # type: ignore
+except Exception:
+    pg = None
+    PlotWidget = None
+
+# ------------------------------
+# Config / Data file locations
+# ------------------------------
 DATA_FILE = "transactions.json"
 SETTINGS_FILE = "settings.json"
 
+# ------------------------------
+# Theme (QSS) (embedded)
+# ------------------------------
+THEME_QSS = r"""
+/* Minimal dark theme */
+QWidget {
+    background-color: #0f1724;
+    color: #e6eef3;
+    font-family: "Segoe UI", "Helvetica Neue", "Arial";
+    font-size: 13px;
+}
+QLabel#title {
+    font-size: 18px;
+    font-weight: 700;
+    color: #ffffff;
+}
+QGroupBox, QFrame {
+    background-color: #0b1220;
+    border: 1px solid rgba(255,255,255,0.04);
+    border-radius: 8px;
+    padding: 8px;
+}
+QPushButton {
+    background-color: #16222b;
+    color: #e6eef3;
+    border: 1px solid rgba(255,255,255,0.04);
+    padding: 6px 10px;
+    border-radius: 8px;
+}
+QPushButton#primary {
+    background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:1, stop:0 #3ddc84, stop:1 #2cc67a);
+    color: #062017;
+    font-weight: 600;
+    border: none;
+}
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
+    background-color: #07121a;
+    border: 1px solid rgba(255,255,255,0.04);
+    padding: 6px;
+    border-radius: 6px;
+    color: #e6eef3;
+}
+QTableView, QHeaderView {
+    background-color: #07121a;
+    border: none;
+    gridline-color: rgba(255,255,255,0.03);
+}
+QHeaderView::section {
+    background-color: transparent;
+    color: #9aa7b2;
+    padding: 6px;
+}
+#toast {
+    background-color: rgba(20, 30, 40, 0.95);
+    color: #e6eef3;
+    border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.04);
+}
+.titlebar-btn {
+    background: transparent;
+    color: #e6eef3;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+.titlebar-btn:hover { background: rgba(255,255,255,0.04); }
+.titlebar-btn#close:hover { background: #ff6b6b; color: #fff; }
+"""
 
-# ---------------- persistence ----------------
+# ------------------------------
+# Small utilities
+# ------------------------------
 def load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -27,14 +167,43 @@ def load_json(path: str, default):
     except FileNotFoundError:
         return default
     except json.JSONDecodeError:
+        # If corrupted, return default; caller may want to alert user.
         return default
 
 
+def save_json_atomic(path: str, data) -> None:
+    """
+    Write JSON atomically to avoid partial file writes that may corrupt the file.
+    """
+    dirpath = os.path.dirname(path) or "."
+    os.makedirs(dirpath, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp", dir=dirpath)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
 def save_json(path: str, data) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    save_json_atomic(path, data)
 
 
+def hash_pin(pin: str) -> str:
+    # Note: This uses plain SHA-256 for compatibility with v1. Consider PBKDF2/Argon2 for improved security.
+    return hashlib.sha256(pin.encode("utf-8")).hexdigest()
+
+
+# ------------------------------
+# Core logic (unchanged)
+# ------------------------------
 def load_transactions() -> List[Dict[str, Any]]:
     return load_json(DATA_FILE, [])
 
@@ -51,29 +220,29 @@ def save_settings(settings: Dict[str, Any]) -> None:
     save_json(SETTINGS_FILE, settings)
 
 
-# ---------------- core logic ----------------
 def totals(txs: List[Dict[str, Any]]) -> Dict[str, float]:
-    income = sum(t["amount"] for t in txs if t["type"] == "income")
-    expenses = sum(t["amount"] for t in txs if t["type"] == "expense")
+    income = sum(float(t.get("amount", 0.0)) for t in txs if t.get("type") == "income")
+    expenses = sum(float(t.get("amount", 0.0)) for t in txs if t.get("type") == "expense")
     return {"income": income, "expenses": expenses, "net": income - expenses}
 
 
 def totals_by_category(txs: List[Dict[str, Any]], ttype: Optional[str] = None) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for t in txs:
-        if ttype and t["type"] != ttype:
+        if ttype and t.get("type") != ttype:
             continue
-        out[t["category"]] = out.get(t["category"], 0.0) + float(t["amount"])
+        cat = t.get("category", "Uncategorized")
+        try:
+            amt = float(t.get("amount", 0.0))
+        except Exception:
+            amt = 0.0
+        out[cat] = out.get(cat, 0.0) + amt
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0].lower())))
 
 
 def filter_month(txs: List[Dict[str, Any]], year: int, month: int) -> List[Dict[str, Any]]:
     prefix = f"{year:04d}-{month:02d}-"
-    return [t for t in txs if t["date"].startswith(prefix)]
-
-
-def hash_pin(pin: str) -> str:
-    return hashlib.sha256(pin.encode("utf-8")).hexdigest()
+    return [t for t in txs if str(t.get("date", "")).startswith(prefix)]
 
 
 def rating_from_net(net_savings: float) -> Dict[str, Any]:
@@ -97,13 +266,312 @@ def rating_from_net(net_savings: float) -> Dict[str, Any]:
         return {"points": points, "label": "Poor", "message": "Your savings are in poor condition."}
 
 
-# ---------------- GUI ----------------
+# ------------------------------
+# UI Helpers (Toast, fade)
+# ------------------------------
+class Toast(QWidget):
+    """Non-blocking toast message."""
+
+    def __init__(self, parent: QWidget, message: str, duration: int = 1800):
+        super().__init__(parent, flags=Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.duration = duration
+        self._build_ui(message)
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(260)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+
+    def _build_ui(self, message: str):
+        self.setObjectName("toast")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 8, 14, 8)
+        lbl = QLabel(message)
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+        self.adjustSize()
+
+    def show_(self):
+        parent = self.parentWidget()
+        if parent is None:
+            screen_geo = QApplication.primaryScreen().availableGeometry()
+            x = screen_geo.right() - self.width() - 24
+            y = screen_geo.bottom() - self.height() - 24
+            self.move(x, y)
+        else:
+            rect = parent.geometry()
+            x = rect.right() - self.width() - 24
+            y = rect.bottom() - self.height() - 24
+            self.move(x, y)
+        self.setWindowOpacity(0.0)
+        super().show()
+        self._fade.setDirection(QPropertyAnimation.Forward)
+        self._fade.start()
+        QTimer.singleShot(self.duration, self.close_with_fade)
+
+    def close_with_fade(self):
+        self._fade.setDirection(QPropertyAnimation.Backward)
+        self._fade.finished.connect(self.close)
+        self._fade.start()
+
+
+def fade_in_widget(widget: QWidget, duration: int = 300):
+    """
+    Apply a simple opacity fade-in to a widget. Useful for page transitions.
+    """
+    try:
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", widget)
+        anim.setDuration(duration)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
+    except Exception:
+        pass
+
+
+def load_stylesheet_from_string(app: QApplication, qss: str):
+    try:
+        app.setStyleSheet(qss)
+    except Exception:
+        pass
+
+
+# ------------------------------
+# Custom Title Bar (frameless window)
+# ------------------------------
+class TitleBar(QWidget):
+    """
+    Custom title bar with drag-to-move and control buttons.
+    """
+
+    def __init__(self, parent: QMainWindow):
+        super().__init__(parent)
+        self._parent = parent
+        self._drag_pos: Optional[QPoint] = None
+        self._is_maximized = False
+
+        self.setFixedHeight(36)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 0, 8, 0)
+        lay.setSpacing(6)
+
+        # Title
+        self.lbl_title = QLabel(self._parent.windowTitle(), self)
+        self.lbl_title.setObjectName("title")
+        self.lbl_title.setMinimumWidth(120)
+        lay.addWidget(self.lbl_title)
+        lay.addStretch(1)
+
+        # optional refresh button
+        self.btn_refresh = QPushButton("⟳", self)
+        self.btn_refresh.setObjectName("refresh")
+        self.btn_refresh.setFixedSize(30, 26)
+        self.btn_refresh.clicked.connect(lambda: getattr(self._parent, "refresh_all", lambda: None)())
+        lay.addWidget(self.btn_refresh)
+
+        # Minimize, Maximize/Restore, Close
+        self.btn_min = QPushButton("▁", self)
+        self.btn_min.setObjectName("min")
+        self.btn_min.setFixedSize(36, 26)
+        self.btn_min.clicked.connect(self._parent.showMinimized)
+        lay.addWidget(self.btn_min)
+
+        self.btn_max = QPushButton("▢", self)
+        self.btn_max.setObjectName("max")
+        self.btn_max.setFixedSize(36, 26)
+        self.btn_max.clicked.connect(self.toggle_max_restore)
+        lay.addWidget(self.btn_max)
+
+        self.btn_close = QPushButton("✕", self)
+        self.btn_close.setObjectName("close")
+        self.btn_close.setFixedSize(36, 26)
+        self.btn_close.clicked.connect(self._parent.close)
+        lay.addWidget(self.btn_close)
+
+        self.setStyleSheet("")  # global QSS handles styling
+
+    def update_title(self, text: str):
+        self.lbl_title.setText(text)
+
+    def toggle_max_restore(self):
+        if self._is_maximized:
+            self._parent.showNormal()
+            self._is_maximized = False
+            self.btn_max.setText("▢")
+        else:
+            self._parent.showMaximized()
+            self._is_maximized = True
+            self.btn_max.setText("❐")
+
+    # Helper to get a QPoint from the event in a version-safe way
+    @staticmethod
+    def _global_point_from_event(event):
+        try:
+            # Qt 6.5+: globalPosition returns QPointF
+            return event.globalPosition().toPoint()
+        except Exception:
+            try:
+                # older API
+                return event.globalPos()
+            except Exception:
+                return QPoint()
+
+    # Mouse handling for dragging the window
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = self._global_point_from_event(event) - self._parent.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos and event.buttons() & Qt.LeftButton:
+            self._parent.move(self._global_point_from_event(event) - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.toggle_max_restore()
+            event.accept()
+
+
+# ------------------------------
+# TransactionModel for History
+# ------------------------------
+class TransactionModel(QAbstractTableModel):
+    HEADERS = ["Date", "Type", "Amount", "Category", "Note", "Created", "ID"]
+
+    def __init__(self, txs: Optional[List[Dict[str, Any]]] = None):
+        super().__init__()
+        self.txs: List[Dict[str, Any]] = txs or []
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self.txs)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.HEADERS)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        t = self.txs[index.row()]
+        col = index.column()
+        if role == Qt.DisplayRole:
+            if col == 0:
+                return str(t.get("date", ""))
+            if col == 1:
+                return str(t.get("type", ""))
+            if col == 2:
+                try:
+                    return f"{float(t.get('amount', 0.0)):.2f}"
+                except Exception:
+                    return "0.00"
+            if col == 3:
+                return str(t.get("category", ""))
+            if col == 4:
+                return str(t.get("note", ""))
+            if col == 5:
+                return str(t.get("created_at", ""))
+            if col == 6:
+                return str(t.get("id", ""))
+        if role == Qt.TextAlignmentRole:
+            if col == 2:
+                return Qt.AlignRight | Qt.AlignVCenter
+            return Qt.AlignLeft | Qt.AlignVCenter
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            return self.HEADERS[section]
+        return section + 1
+
+    def sort(self, column, order):
+        key_map = {
+            0: lambda t: t.get("date", ""),
+            1: lambda t: t.get("type", ""),
+            2: lambda t: float(t.get("amount", 0.0)),
+            3: lambda t: t.get("category", ""),
+            4: lambda t: t.get("note", ""),
+            5: lambda t: t.get("created_at", ""),
+            6: lambda t: t.get("id", ""),
+        }
+        key = key_map.get(column, lambda t: "")
+        self.layoutAboutToBeChanged.emit()
+        self.txs.sort(key=key, reverse=(order == Qt.DescendingOrder))
+        self.layoutChanged.emit()
+
+    def update(self, txs: List[Dict[str, Any]]):
+        self.beginResetModel()
+        self.txs = txs
+        self.endResetModel()
+
+
+# ------------------------------
+# Chart Widget (optional)
+# ------------------------------
+class ChartWidget(QWidget):
+    """
+    Small chart for dashboard. If pyqtgraph is installed it will show an interactive
+    line chart; otherwise it falls back to a simple textual summary.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        if PlotWidget and pg:
+            self.plot = PlotWidget(background="transparent")
+            self.plot.setBackground(None)
+            try:
+                self.plot.showGrid(x=True, y=True, alpha=0.2)
+                self.plot.getPlotItem().getAxis("left").setPen(pg.mkPen("#9aa7b2"))
+                self.plot.getPlotItem().getAxis("bottom").setPen(pg.mkPen("#9aa7b2"))
+            except Exception:
+                pass
+            self.plot.setTitle("Net Savings Over Time", color="#e6eef3", size="12pt")
+            self.net_curve = self.plot.plot([], [], pen=pg.mkPen("#3ddc84", width=2), name="Net")
+            self.income_curve = self.plot.plot([], [], pen=pg.mkPen("#6eb0ff", width=2), name="Income")
+            self.expense_curve = self.plot.plot([], [], pen=pg.mkPen("#ff6b6b", width=2), name="Expenses")
+            layout.addWidget(self.plot)
+        else:
+            self.label = QLabel("Install 'pyqtgraph' for an interactive chart.")
+            layout.addWidget(self.label)
+
+    def update_data(self, points: List[Tuple[str, float, float, float]]):
+        if not pg or not PlotWidget:
+            return
+        xs = list(range(len(points)))
+        nets = [p[1] for p in points]
+        incs = [p[2] for p in points]
+        exps = [p[3] for p in points]
+        self.net_curve.setData(xs, nets)
+        self.income_curve.setData(xs, incs)
+        self.expense_curve.setData(xs, exps)
+        # show last 12
+        rng = max(0, len(points) - 12)
+        self.plot.getPlotItem().setXRange(rng, len(points))
+
+
+# ------------------------------
+# Main Application Window
+# ------------------------------
 class FinanceTrackerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Midaxas Finance")
         self.resize(980, 640)
 
+        # Remove native title bar (frameless)
+        self.setWindowFlag(Qt.FramelessWindowHint)
+
+        # Data
         self.settings = load_settings()
         if self.settings.get("pin_hash"):
             if not self.prompt_pin():
@@ -112,27 +580,69 @@ class FinanceTrackerGUI(QMainWindow):
 
         self.txs: List[Dict[str, Any]] = load_transactions()
 
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
+        # Central widget with stacked pages
+        container = QWidget()
+        self.setCentralWidget(container)
+        self.stack = QStackedWidget()
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        self.tab_dashboard = QWidget()
-        self.tab_add = QWidget()
-        self.tab_history = QWidget()
-        self.tab_summary = QWidget()
-        self.tab_month = QWidget()
-        self.tab_budgets = QWidget()
-        self.tab_export = QWidget()
-        self.tab_settings = QWidget()
+        # Custom title bar (keeps the single refresh icon)
+        self.titlebar = TitleBar(self)
+        main_layout.addWidget(self.titlebar)
 
-        self.tabs.addTab(self.tab_dashboard, "Dashboard")
-        self.tabs.addTab(self.tab_add, "Add")
-        self.tabs.addTab(self.tab_history, "History")
-        self.tabs.addTab(self.tab_summary, "Summary")
-        self.tabs.addTab(self.tab_month, "Monthly")
-        self.tabs.addTab(self.tab_budgets, "Budgets")
-        self.tabs.addTab(self.tab_export, "Export")
-        self.tabs.addTab(self.tab_settings, "Settings")
+        # small spacing between titlebar and UI content (no duplicate title / refresh)
+        main_layout.addSpacing(6)
 
+        main_layout.addWidget(self.stack)
+
+        # Pages
+        self.page_dashboard = QWidget()
+        self.page_add = QWidget()
+        self.page_history = QWidget()
+        self.page_summary = QWidget()
+        self.page_month = QWidget()
+        self.page_budgets = QWidget()
+        self.page_export = QWidget()
+        self.page_settings = QWidget()
+
+        for p in (
+            self.page_dashboard,
+            self.page_add,
+            self.page_history,
+            self.page_summary,
+            self.page_month,
+            self.page_budgets,
+            self.page_export,
+            self.page_settings,
+        ):
+            self.stack.addWidget(p)
+
+        # Navigation row
+        nav = QHBoxLayout()
+        nav.setContentsMargins(12, 8, 12, 8)
+        names = [
+            ("Dashboard", 0),
+            ("Add", 1),
+            ("History", 2),
+            ("Summary", 3),
+            ("Monthly", 4),
+            ("Budgets", 5),
+            ("Export", 6),
+            ("Settings", 7),
+        ]
+        nav_widget = QWidget()
+        nav_layout = QHBoxLayout(nav_widget)
+        nav_layout.setContentsMargins(12, 0, 12, 0)
+        for title, idx in names:
+            b = QPushButton(title)
+            b.clicked.connect(lambda checked, i=idx: self.switch_page(i))
+            nav_layout.addWidget(b)
+        nav_layout.addStretch(1)
+        main_layout.addWidget(nav_widget)
+
+        # Build pages
         self.build_dashboard()
         self.build_add()
         self.build_history()
@@ -142,7 +652,22 @@ class FinanceTrackerGUI(QMainWindow):
         self.build_export()
         self.build_settings()
 
+        # Start on dashboard
+        self.switch_page(0, animate=False)
         self.refresh_all()
+
+        # Menubar actions (kept for keyboard/menu use)
+        self._add_menu()
+
+    def _add_menu(self):
+        menu = self.menuBar()
+        filemenu = menu.addMenu("&File")
+        act_export = QAction("Export CSV…", self)
+        act_export.triggered.connect(self.export_csv)
+        filemenu.addAction(act_export)
+        act_quit = QAction("Quit", self)
+        act_quit.triggered.connect(self.close)
+        filemenu.addAction(act_quit)
 
     # ---------- PIN ----------
     def prompt_pin(self) -> bool:
@@ -150,7 +675,7 @@ class FinanceTrackerGUI(QMainWindow):
             pin, ok = QInputDialog.getText(self, "PIN Required", "Enter PIN:", QLineEdit.Password)
             if not ok:
                 return False
-            if hash_pin(pin) == self.settings["pin_hash"]:
+            if hash_pin(pin) == self.settings.get("pin_hash"):
                 return True
             QMessageBox.warning(self, "Wrong PIN", "Wrong PIN.")
         return False
@@ -168,47 +693,49 @@ class FinanceTrackerGUI(QMainWindow):
         self.refresh_monthly_report()
 
     def show_error(self, msg: str):
-        QMessageBox.critical(self, "Error", msg)
+        Toast(self, msg, duration=2200).show_()
 
     def show_info(self, msg: str):
-        QMessageBox.information(self, "Info", msg)
+        Toast(self, msg, duration=1400).show_()
+
+    def switch_page(self, index: int, animate: bool = True):
+        if 0 <= index < self.stack.count():
+            self.stack.setCurrentIndex(index)
+            if animate:
+                fade_in_widget(self.stack.currentWidget(), duration=320)
 
     # ---------- Dashboard ----------
     def build_dashboard(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.page_dashboard.setLayout(layout)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<h2>Dashboard</h2>"))
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        stats_box = QGroupBox()
+        sb_layout = QVBoxLayout()
+        stats_box.setLayout(sb_layout)
 
         self.lbl_totals = QLabel("")
         self.lbl_totals.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
         self.lbl_rating = QLabel("")
         self.lbl_rating.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
         self.lbl_budget_warnings = QLabel("")
         self.lbl_budget_warnings.setWordWrap(True)
         self.lbl_budget_warnings.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        btn_row = QHBoxLayout()
-        self.btn_refresh = QPushButton("Refresh")
-        self.btn_refresh.clicked.connect(self.refresh_all)
-        self.btn_undo = QPushButton("Undo Last Transaction")
-        self.btn_undo.clicked.connect(self.undo_last)
-        self.btn_reset = QPushButton("Reset ALL Data")
-        self.btn_reset.clicked.connect(self.reset_all)
+        sb_layout.addWidget(self.lbl_totals)
+        sb_layout.addWidget(self.lbl_rating)
+        sb_layout.addWidget(QLabel("<b>Budget warnings (this month):</b>"))
+        sb_layout.addWidget(self.lbl_budget_warnings)
+        layout.addWidget(stats_box)
 
-        btn_row.addWidget(self.btn_refresh)
-        btn_row.addWidget(self.btn_undo)
-        btn_row.addWidget(self.btn_reset)
-        btn_row.addStretch(1)
-
-        layout.addWidget(QLabel("<h2>Dashboard</h2>"))
-        layout.addLayout(btn_row)
-        layout.addWidget(self.lbl_totals)
-        layout.addWidget(self.lbl_rating)
-        layout.addWidget(QLabel("<b>Budget warnings (this month):</b>"))
-        layout.addWidget(self.lbl_budget_warnings)
-        layout.addStretch(1)
-
-        self.tab_dashboard.setLayout(layout)
+        # Chart
+        self.chart = ChartWidget()
+        layout.addWidget(self.chart)
 
     def refresh_dashboard(self):
         t = totals(self.txs)
@@ -226,42 +753,54 @@ class FinanceTrackerGUI(QMainWindow):
         budgets = self.settings.get("budgets", {}) or {}
         if not budgets:
             self.lbl_budget_warnings.setText("No budgets set.")
-            return
+        else:
+            spent = totals_by_category(month_txs, ttype="expense")
+            lines = []
+            for cat, limit in budgets.items():
+                try:
+                    limit_val = float(limit)
+                except Exception:
+                    limit_val = 0.0
+                if limit_val <= 0:
+                    continue
+                used = spent.get(cat, 0.0)
+                pct = (used / limit_val) * 100.0 if limit_val else 0.0
+                if pct >= 100:
+                    lines.append(f"OVER: {cat} — {used:.2f}/{limit_val:.2f} ({pct:.0f}%)")
+                elif pct >= 80:
+                    lines.append(f"Near: {cat} — {used:.2f}/{limit_val:.2f} ({pct:.0f}%)")
+            self.lbl_budget_warnings.setText("\n".join(lines) if lines else "All budgets look OK.")
 
-        spent = totals_by_category(month_txs, ttype="expense")
-        lines = []
-        for cat, limit in budgets.items():
-            if limit <= 0:
-                continue
-            used = spent.get(cat, 0.0)
-            pct = (used / limit) * 100.0
-            if pct >= 100:
-                lines.append(f"OVER: {cat} — {used:.2f}/{limit:.2f} ({pct:.0f}%)")
-            elif pct >= 80:
-                lines.append(f"Near: {cat} — {used:.2f}/{limit:.2f} ({pct:.0f}%)")
-        self.lbl_budget_warnings.setText("\n".join(lines) if lines else "All budgets look OK.")
+        # Update chart - produce last 12 months aggregates
+        points = []
+        today = date.today()
+        for i in range(11, -1, -1):
+            month_index = (today.month - i - 1)
+            year = today.year + (month_index // 12)
+            mth = (month_index % 12) + 1
+            subset = filter_month(self.txs, year, mth)
+            tsub = totals(subset)
+            points.append((f"{year:04d}-{mth:02d}", tsub["net"], tsub["income"], tsub["expenses"]))
+        self.chart.update_data(points)
 
     # ---------- Add ----------
     def build_add(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.page_add.setLayout(layout)
         layout.addWidget(QLabel("<h2>Add Transaction</h2>"))
 
         form = QFormLayout()
-
-        self.cmb_type = QComboBox()
-        self.cmb_type.addItems(["income", "expense"])
-
+        self.cmb_type = QLineEdit()
+        self.cmb_type.setPlaceholderText("income or expense (default: expense)")
         self.txt_date = QLineEdit()
         self.txt_date.setPlaceholderText("YYYY-MM-DD (leave empty for today)")
-
         self.spn_amount = QDoubleSpinBox()
         self.spn_amount.setRange(0.01, 1e12)
         self.spn_amount.setDecimals(2)
         self.spn_amount.setSingleStep(10.0)
-
         self.txt_category = QLineEdit()
         self.txt_category.setPlaceholderText("e.g. Food, Rent, Salary")
-
         self.txt_note = QLineEdit()
         self.txt_note.setPlaceholderText("optional")
 
@@ -273,6 +812,7 @@ class FinanceTrackerGUI(QMainWindow):
 
         btns = QHBoxLayout()
         btn_add = QPushButton("Add")
+        btn_add.setObjectName("primary")
         btn_add.clicked.connect(self.add_tx)
         btn_clear = QPushButton("Clear Fields")
         btn_clear.clicked.connect(self.clear_add_fields)
@@ -282,18 +822,20 @@ class FinanceTrackerGUI(QMainWindow):
 
         layout.addLayout(form)
         layout.addLayout(btns)
-        layout.addStretch(1)
-
-        self.tab_add.setLayout(layout)
 
     def clear_add_fields(self):
         self.txt_date.clear()
         self.spn_amount.setValue(10.0)
         self.txt_category.clear()
         self.txt_note.clear()
+        self.cmb_type.clear()
 
     def add_tx(self):
-        ttype = self.cmb_type.currentText().strip()
+        ttype = self.cmb_type.text().strip().lower() or "expense"
+        if ttype not in ("income", "expense"):
+            self.show_error("Type must be 'income' or 'expense'.")
+            return
+
         d = self.txt_date.text().strip()
         if not d:
             d = date.today().isoformat()
@@ -325,15 +867,15 @@ class FinanceTrackerGUI(QMainWindow):
         self.save()
         self.refresh_all()
         self.show_info("Saved ✅")
+        self.clear_add_fields()
+        self.switch_page(0)
 
     # ---------- History ----------
     def build_history(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.page_history.setLayout(layout)
         layout.addWidget(QLabel("<h2>History</h2>"))
-
-        self.tbl = QTableWidget(0, 6)
-        self.tbl.setHorizontalHeaderLabels(["Date", "Type", "Amount", "Category", "Note", "Created"])
-        self.tbl.setSortingEnabled(True)
 
         row = QHBoxLayout()
         btn_refresh = QPushButton("Refresh")
@@ -343,38 +885,37 @@ class FinanceTrackerGUI(QMainWindow):
         row.addWidget(btn_refresh)
         row.addWidget(btn_delete)
         row.addStretch(1)
-
         layout.addLayout(row)
-        layout.addWidget(self.tbl)
 
-        self.tab_history.setLayout(layout)
+        self.table = QTableView()
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionsClickable(True)
+        # Use QAbstractItemView enum for selection behavior and mode:
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setSortingEnabled(True)
+        layout.addWidget(self.table)
+
+        self.model = TransactionModel([])
+        self.table.setModel(self.model)
+        # hide the ID column visually (but keep it in model)
+        self.table.setColumnHidden(6, True)
 
     def refresh_history(self):
         data = sorted(self.txs, key=lambda x: (x.get("date", ""), x.get("created_at", "")), reverse=True)
-        self.tbl.setRowCount(len(data))
-        for r, t in enumerate(data):
-            items = [
-                QTableWidgetItem(str(t.get("date", ""))),
-                QTableWidgetItem(str(t.get("type", ""))),
-                QTableWidgetItem(f"{float(t.get('amount', 0.0)):.2f}"),
-                QTableWidgetItem(str(t.get("category", ""))),
-                QTableWidgetItem(str(t.get("note", ""))),
-                QTableWidgetItem(str(t.get("created_at", ""))),
-            ]
-            for c, it in enumerate(items):
-                it.setFlags(it.flags() ^ Qt.ItemIsEditable)
-                self.tbl.setItem(r, c, it)
+        self.model.update(data)
 
     def selected_tx_id(self) -> Optional[int]:
-        row = self.tbl.currentRow()
-        if row < 0:
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
             return None
-        # We need to map table row -> transaction. We refresh sorted desc,
-        # so we reconstruct the same ordering and index.
-        data = sorted(self.txs, key=lambda x: (x.get("date", ""), x.get("created_at", "")), reverse=True)
-        if row >= len(data):
+        index = sel[0]
+        model_index = index.siblingAtColumn(6)
+        txid = self.model.data(model_index, Qt.DisplayRole)
+        try:
+            return int(txid)
+        except Exception:
             return None
-        return int(data[row].get("id"))
 
     def delete_selected(self):
         tx_id = self.selected_tx_id()
@@ -386,10 +927,13 @@ class FinanceTrackerGUI(QMainWindow):
         self.txs = [t for t in self.txs if int(t.get("id", -1)) != tx_id]
         self.save()
         self.refresh_all()
+        self.show_info("Deleted ✅")
 
     # ---------- Summary ----------
     def build_summary(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.page_summary.setLayout(layout)
         layout.addWidget(QLabel("<h2>Summary</h2>"))
 
         self.lbl_summary = QLabel("")
@@ -407,8 +951,6 @@ class FinanceTrackerGUI(QMainWindow):
         layout.addWidget(QLabel("<b>Income by category</b>"))
         layout.addWidget(self.txt_inc_cat)
 
-        self.tab_summary.setLayout(layout)
-
     def refresh_summary(self):
         t = totals(self.txs)
         self.lbl_summary.setText(
@@ -425,6 +967,8 @@ class FinanceTrackerGUI(QMainWindow):
     # ---------- Monthly ----------
     def build_monthly(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.page_month.setLayout(layout)
         layout.addWidget(QLabel("<h2>Monthly Report</h2>"))
 
         row = QHBoxLayout()
@@ -450,7 +994,6 @@ class FinanceTrackerGUI(QMainWindow):
 
         layout.addLayout(row)
         layout.addWidget(self.txt_month)
-        self.tab_month.setLayout(layout)
 
     def refresh_monthly_report(self):
         y = int(self.spn_year.value())
@@ -467,7 +1010,7 @@ class FinanceTrackerGUI(QMainWindow):
             f"Expense: {t['expenses']:.2f}",
             f"Net    : {t['net']:.2f}",
             "",
-            "Top expense categories:"
+            "Top expense categories:",
         ]
         for cat, amt in top:
             lines.append(f"  {cat}: {amt:.2f}")
@@ -476,6 +1019,8 @@ class FinanceTrackerGUI(QMainWindow):
     # ---------- Budgets ----------
     def build_budgets(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.page_budgets.setLayout(layout)
         layout.addWidget(QLabel("<h2>Budgets</h2>"))
 
         form = QFormLayout()
@@ -504,8 +1049,6 @@ class FinanceTrackerGUI(QMainWindow):
         layout.addLayout(btn_row)
         layout.addWidget(QLabel("<b>Current budgets</b>"))
         layout.addWidget(self.txt_budgets)
-
-        self.tab_budgets.setLayout(layout)
 
     def refresh_budget_view(self):
         budgets = self.settings.get("budgets", {}) or {}
@@ -546,14 +1089,12 @@ class FinanceTrackerGUI(QMainWindow):
     # ---------- Export ----------
     def build_export(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.page_export.setLayout(layout)
         layout.addWidget(QLabel("<h2>Export</h2>"))
-
         btn = QPushButton("Export CSV…")
         btn.clicked.connect(self.export_csv)
-
         layout.addWidget(btn)
-        layout.addStretch(1)
-        self.tab_export.setLayout(layout)
 
     def export_csv(self):
         if not self.txs:
@@ -562,32 +1103,40 @@ class FinanceTrackerGUI(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "export.csv", "CSV Files (*.csv)")
         if not path:
             return
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["id", "date", "type", "amount", "category", "note", "created_at"])
-            for t in sorted(self.txs, key=lambda x: (x.get("date", ""), x.get("created_at", ""))):
-                w.writerow([
-                    t.get("id"), t.get("date"), t.get("type"), t.get("amount"),
-                    t.get("category"), t.get("note", ""), t.get("created_at", "")
-                ])
-        self.show_info("Exported ✅")
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["id", "date", "type", "amount", "category", "note", "created_at"])
+                for t in sorted(self.txs, key=lambda x: (x.get("date", ""), x.get("created_at", ""))):
+                    w.writerow(
+                        [
+                            t.get("id"),
+                            t.get("date"),
+                            t.get("type"),
+                            t.get("amount"),
+                            t.get("category"),
+                            t.get("note", ""),
+                            t.get("created_at", ""),
+                        ]
+                    )
+            self.show_info("Exported ✅")
+        except Exception as exc:
+            self.show_error(f"Export failed: {exc}")
 
     # ---------- Settings ----------
     def build_settings(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.page_settings.setLayout(layout)
         layout.addWidget(QLabel("<h2>Settings</h2>"))
 
         btn_set_pin = QPushButton("Set / Change PIN")
         btn_set_pin.clicked.connect(self.set_pin)
-
         btn_clear_pin = QPushButton("Remove PIN")
         btn_clear_pin.clicked.connect(self.remove_pin)
 
         layout.addWidget(btn_set_pin)
         layout.addWidget(btn_clear_pin)
-        layout.addStretch(1)
-
-        self.tab_settings.setLayout(layout)
 
     def set_pin(self):
         if self.settings.get("pin_hash"):
@@ -650,6 +1199,7 @@ class FinanceTrackerGUI(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    load_stylesheet_from_string(app, THEME_QSS)
     win = FinanceTrackerGUI()
     win.show()
     sys.exit(app.exec())
